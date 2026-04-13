@@ -123,10 +123,6 @@ class OktaDuoUniversal:
         if self.duo_factor != 'Duo Push':
             raise Exception(f'Factor "{self.duo_factor}" is not supported in Duo JS-bundle fallback yet. Use Duo Push.')
 
-        # Extract OIDC state for external/exit endpoint
-        oidc_state = self._extract_oidc_state(tx_context)
-        tx_context['oidc_state'] = oidc_state
-
         headers = self._get_prompt_api_headers(tx_context['req_trace_group'])
         pkey = self._discover_push_authenticator_key(tx_context, headers)
         push_txid = self._initiate_js_bundle_push(tx_context, headers, pkey)
@@ -142,40 +138,6 @@ class OktaDuoUniversal:
         if req_trace_group:
             headers['x-duo-request-id'] = req_trace_group
         return headers
-
-    def _extract_oidc_state(self, tx_context):
-        """
-        Extract OIDC state parameter from Duo's OIDC authorize JWT token.
-        The state is needed for the external/exit endpoint call.
-        """
-        try:
-            # Call the OAuth authorize endpoint - this will redirect to the OIDC authorize endpoint
-            # with a JWT token that contains the state
-            duo_origin = tx_context['duo_origin']
-
-            # First, we need to get the OAuth request JWT. We'll call the prompt page to get it
-            # by following the Okta redirect chain. This is implicit in the verify flow.
-            # For now, try to call the OIDC authorize endpoint and extract state from the redirect
-
-            # Build the OIDC authorize URL - we need the ikey and client_id from the akey
-            # These should be available or we can try common patterns
-            akey = tx_context['akey']
-
-            # Call the prompt page again with finalize_auth to get the state
-            headers = self._get_prompt_api_headers(tx_context.get('req_trace_group'))
-            authkey = tx_context['authkey']
-
-            # If we can't get state from finalize_auth, generate a UUID as fallback
-            # This is not ideal but allows the flow to continue
-            import uuid
-            state = str(uuid.uuid4())
-            self.ui.warning(f"Could not extract OIDC state from Duo, using generated UUID: {state}")
-            return state
-
-        except Exception as e:
-            self.ui.warning(f"Error extracting OIDC state: {e}. Using generated UUID fallback.")
-            import uuid
-            return str(uuid.uuid4())
 
     @staticmethod
     def _flatten_values(value):
