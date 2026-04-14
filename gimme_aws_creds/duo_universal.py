@@ -1,12 +1,9 @@
 import time
 import json
-import os
-from datetime import datetime, timezone
-from http.cookies import SimpleCookie
 
 import html5lib
 from furl import furl
-from urllib.parse import urlparse, parse_qs, parse_qsl
+from urllib.parse import urlparse, parse_qs
 
 from . import version
 
@@ -21,7 +18,7 @@ class DuoMfaDenied(BaseException):
 class OktaDuoUniversal:
     """ Handles interaction with the Duo Universal Prompt """
 
-    def __init__(self, ui, session, state_token, okta_factor, remember_device, duo_factor='Duo Push', duo_passcode=None, duo_har_dump_path=None):
+    def __init__(self, ui, session, state_token, okta_factor, remember_device, duo_factor='Duo Push', duo_passcode=None):
         self.ui = ui
         self.state_token = state_token
         self.okta_factor = okta_factor
@@ -31,43 +28,38 @@ class OktaDuoUniversal:
             raise Exception('Preferred Duo Universal factor must be one of: Duo Push, Passcode, Phone Call')
         self.duo_factor = duo_factor
         self.duo_passcode = duo_passcode
-        self._duo_har_dump_path = duo_har_dump_path or os.environ.get('GIMME_AWS_CREDS_DUO_HAR_DUMP_PATH')
-        self._duo_har_entries = []
 
     def do_auth(self):
         """ Follow Duo Universal Prompt flow through to an active Okta user session """
-        try:
-            duo_prompt_url, okta_profile_login = self._initiate_okta_factor_verification()
-            duo_origin, duo_plugin_form_response = self._handle_duo_plugin_form(duo_prompt_url)
+        duo_prompt_url, okta_profile_login = self._initiate_okta_factor_verification()
+        duo_origin, duo_plugin_form_response = self._handle_duo_plugin_form(duo_prompt_url)
 
-            tx_context = self._build_transaction_context(duo_origin, duo_plugin_form_response)
+        tx_context = self._build_transaction_context(duo_origin, duo_plugin_form_response)
 
-            self.ui.info(f"Duo Universal: Using {self.duo_factor}...")
+        self.ui.info(f"Duo Universal: Using {self.duo_factor}...")
 
-            if tx_context['mode'] == 'legacy_form':
-                duo_factor, duo_sid, duo_txid, duo_xsrf = self._trigger_legacy_duo_factor(duo_origin, duo_plugin_form_response)
-                self._wait_for_duo_universal_transaction(duo_origin, duo_txid, duo_sid)
-                self._complete_oidc_exit(duo_origin, duo_txid, duo_sid, duo_factor, duo_xsrf)
-            else:
-                self._perform_js_bundle_flow(tx_context)
+        if tx_context['mode'] == 'legacy_form':
+            duo_factor, duo_sid, duo_txid, duo_xsrf = self._trigger_legacy_duo_factor(duo_origin, duo_plugin_form_response)
+            self._wait_for_duo_universal_transaction(duo_origin, duo_txid, duo_sid)
+            self._complete_oidc_exit(duo_origin, duo_txid, duo_sid, duo_factor, duo_xsrf)
+        else:
+            self._perform_js_bundle_flow(tx_context)
 
-            # The claims_provider factor immediately yields an active user session, no subsequent request for SID required.
-            if 'sid' not in self.session.cookies:
-                raise Exception('Duo authentication succeeded but Okta session cookie (sid) was not established. This may indicate the authorization URL endpoint is not accessible in your Duo configuration.')
+        # The claims_provider factor immediately yields an active user session, no subsequent request for SID required.
+        if 'sid' not in self.session.cookies:
+            raise Exception('Duo authentication succeeded but Okta session cookie (sid) was not established. This may indicate the authorization URL endpoint is not accessible in your Duo configuration.')
 
-            return {
-                'apiResponse': {
-                    'status': 'SUCCESS',
-                    'userSession': {
-                        "username": okta_profile_login,
-                        "session": self.session.cookies['sid'],
-                        "device_token": self.session.cookies.get('DT', '')
-                    },
-                    'sessionToken': self.session.cookies['sid']
+        return {
+            'apiResponse': {
+                'status': 'SUCCESS',
+                'userSession': {
+                    "username": okta_profile_login,
+                    "session": self.session.cookies['sid'],
+                    "device_token": self.session.cookies.get('DT', '')
                 },
-            }
-        finally:
-            self._write_duo_har_dump()
+                'sessionToken': self.session.cookies['sid']
+            },
+        }
 
     def _trigger_legacy_duo_factor(self, duo_origin, duo_plugin_form_response):
         # Submit second Duo form (login-form), which triggers a Duo Push, phone call, or accepts the Passcode.
@@ -229,130 +221,8 @@ class OktaDuoUniversal:
             headers['Origin'] = tx_context['duo_origin']
         return headers
 
-    @staticmethod
-    def _parse_cookie_header(cookie_header):
-        if not cookie_header:
-            return []
-        simple_cookie = SimpleCookie()
-        simple_cookie.load(cookie_header)
-        return [{'name': name, 'value': morsel.value} for name, morsel in simple_cookie.items()]
-
-    @staticmethod
-    def _headers_to_har_list(headers):
-        if not headers:
-            return []
-        if hasattr(headers, 'items'):
-            return [{'name': str(key), 'value': str(value)} for key, value in headers.items()]
-        return [{'name': str(key), 'value': str(value)} for key, value in headers]
-
-    @staticmethod
-    def _sanitize_body_text(content_type, body_text):
-        if not body_text:
-            return body_text
-        if 'application/json' not in str(content_type).lower():
-            return body_text
-        try:
-            payload = json.loads(body_text)
-        except Exception:
-            return body_text
-
-        if isinstance(payload, dict):
-            # OTP/passcode values are included in HAR for debugging purposes
-            # for secret_key in ['mobile_otp', 'passcode', 'otp_code']:
-            #     if secret_key in payload and payload[secret_key]:
-            #         payload[secret_key] = '******'
-            return json.dumps(payload, separators=(',', ':'))
-        return body_text
-
-    def _append_har_entry(self, started_at, elapsed_seconds, response):
-        if not self._duo_har_dump_path or response is None or not hasattr(response, 'request'):
-            return
-
-        request = response.request
-        request_headers = self._headers_to_har_list(request.headers)
-        request_cookie_header = request.headers.get('Cookie') if request.headers else None
-        request_cookies = self._parse_cookie_header(request_cookie_header)
-        request_body_text = ''
-        if request.body is not None:
-            if isinstance(request.body, bytes):
-                request_body_text = request.body.decode('utf-8', errors='replace')
-            else:
-                request_body_text = str(request.body)
-        request_content_type = request.headers.get('Content-Type', '') if request.headers else ''
-        request_body_text = self._sanitize_body_text(request_content_type, request_body_text)
-
-        response_headers = self._headers_to_har_list(response.headers)
-        response_cookie_headers = []
-        if response.headers:
-            if hasattr(response.headers, 'getlist'):
-                response_cookie_headers = response.headers.getlist('Set-Cookie')
-            elif hasattr(response.headers, 'get_all'):
-                response_cookie_headers = response.headers.get_all('Set-Cookie')
-            elif response.headers.get('Set-Cookie'):
-                response_cookie_headers = [response.headers.get('Set-Cookie')]
-        response_cookies = []
-        for cookie_header in response_cookie_headers:
-            response_cookies.extend(self._parse_cookie_header(cookie_header))
-
-        response_content_type = response.headers.get('Content-Type', '') if response.headers else ''
-        response_body_text = response.text if response.text is not None else ''
-
-        parsed_url = urlparse(request.url)
-        query_items = [{'name': key, 'value': value} for key, value in parse_qsl(parsed_url.query, keep_blank_values=True)]
-        time_ms = int(elapsed_seconds * 1000)
-        entry = {
-            'startedDateTime': datetime.fromtimestamp(started_at, timezone.utc).isoformat(),
-            'time': time_ms,
-            'request': {
-                'method': request.method,
-                'url': request.url,
-                'httpVersion': 'HTTP/1.1',
-                'headers': request_headers,
-                'cookies': request_cookies,
-                'queryString': query_items,
-                'headersSize': -1,
-                'bodySize': len(request_body_text),
-                'postData': {
-                    'mimeType': request_content_type,
-                    'text': request_body_text,
-                } if request_body_text else {'mimeType': request_content_type, 'text': ''},
-            },
-            'response': {
-                'status': response.status_code,
-                'statusText': response.reason,
-                'httpVersion': 'HTTP/1.1',
-                'headers': response_headers,
-                'cookies': response_cookies,
-                'content': {
-                    'size': len(response.content or b''),
-                    'mimeType': response_content_type,
-                    'text': response_body_text,
-                },
-                'redirectURL': response.headers.get('Location', '') if response.headers else '',
-                'headersSize': -1,
-                'bodySize': len(response.content or b''),
-            },
-            'cache': {},
-            'timings': {
-                'blocked': 0,
-                'dns': -1,
-                'connect': -1,
-                'ssl': -1,
-                'send': 0,
-                'wait': time_ms,
-                'receive': 0,
-            },
-        }
-        self._duo_har_entries.append(entry)
-
     def _request(self, method, url, **kwargs):
-        started_at = time.time()
-        response = None
-        try:
-            response = self.session.request(method, url, **kwargs)
-            return response
-        finally:
-            self._append_har_entry(started_at, time.time() - started_at, response)
+        return self.session.request(method, url, **kwargs)
 
     def _get(self, url, **kwargs):
         return self._request('GET', url, **kwargs)
@@ -360,28 +230,6 @@ class OktaDuoUniversal:
     def _post(self, url, **kwargs):
         return self._request('POST', url, **kwargs)
 
-    def _write_duo_har_dump(self):
-        if not self._duo_har_dump_path:
-            return
-        try:
-            dump_dir = os.path.dirname(self._duo_har_dump_path)
-            if dump_dir:
-                os.makedirs(dump_dir, exist_ok=True)
-            har_document = {
-                'log': {
-                    'version': '1.2',
-                    'creator': {
-                        'name': 'gimme-aws-creds',
-                        'version': str(version),
-                    },
-                    'entries': self._duo_har_entries,
-                }
-            }
-            with open(self._duo_har_dump_path, 'w', encoding='utf-8') as handle:
-                json.dump(har_document, handle, indent=2)
-            self.ui.info(f'Duo Universal HAR dump saved to {self._duo_har_dump_path}')
-        except Exception as error:
-            self.ui.warning(f'Unable to write Duo Universal HAR dump to {self._duo_har_dump_path}: {error}')
 
     @staticmethod
     def _flatten_values(value):

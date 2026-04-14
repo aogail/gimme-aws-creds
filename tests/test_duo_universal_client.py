@@ -1,6 +1,4 @@
 import json
-import os
-import tempfile
 import unittest
 from unittest.mock import Mock
 
@@ -340,48 +338,6 @@ class TestDuoUniversalClient(unittest.TestCase):
         form_action, form_data = duo._get_duo_universal_login_form_data(login_form_response)
         assert form_data['device'] == 'phone1'
 
-    @responses.activate
-    def test_duo_har_dump_captures_500_response(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            har_path = os.path.join(tmpdir, 'duo-debug.har')
-            session = requests.Session()
-            duo = OktaDuoUniversal(
-                ui=MockUserInterface(),
-                session=session,
-                state_token=self.OKTA_STATE_TOKEN,
-                okta_factor=self.OKTA_FACTOR,
-                remember_device=True,
-                duo_har_dump_path=har_path,
-            )
-
-            endpoint = 'https://duo-tenant.duosecurity.com/prompt/debug/auth/factors/mobile_otp'
-            responses.add(
-                method=responses.POST,
-                url=endpoint,
-                status=500,
-                body='{"stat":"FAIL"}',
-                content_type='application/json',
-            )
-
-            response = duo._post(
-                endpoint,
-                json={'authkey': 'AXBBTO9FWHV3P8LOX6D2', 'mobile_otp': '946676'},
-                headers=duo._get_prompt_api_headers('trace-group-123'),
-            )
-            with self.assertRaises(requests.HTTPError):
-                response.raise_for_status()
-
-            duo._write_duo_har_dump()
-            with open(har_path, 'r', encoding='utf-8') as handle:
-                har_data = json.load(handle)
-
-            assert 'log' in har_data
-            assert har_data['log']['version'] == '1.2'
-            assert len(har_data['log']['entries']) == 1
-            entry = har_data['log']['entries'][0]
-            assert entry['request']['url'] == endpoint
-            assert entry['response']['status'] == 500
-            assert entry['request']['postData']['text'] == '{"authkey":"AXBBTO9FWHV3P8LOX6D2","mobile_otp":"946676"}'
 
     def configure_duo_responses(self, duo_factor, passcode=None):
         # Initial request to Okta to verify IDP factor
