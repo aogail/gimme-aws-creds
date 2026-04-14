@@ -1,9 +1,12 @@
 import time
 import json
+import os
+from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 
 import html5lib
 from furl import furl
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl
 
 from . import version
 
@@ -18,7 +21,7 @@ class DuoMfaDenied(BaseException):
 class OktaDuoUniversal:
     """ Handles interaction with the Duo Universal Prompt """
 
-    def __init__(self, ui, session, state_token, okta_factor, remember_device, duo_factor='Duo Push', duo_passcode=None):
+    def __init__(self, ui, session, state_token, okta_factor, remember_device, duo_factor='Duo Push', duo_passcode=None, duo_har_dump_path=None):
         self.ui = ui
         self.state_token = state_token
         self.okta_factor = okta_factor
@@ -28,39 +31,43 @@ class OktaDuoUniversal:
             raise Exception('Preferred Duo Universal factor must be one of: Duo Push, Passcode, Phone Call')
         self.duo_factor = duo_factor
         self.duo_passcode = duo_passcode
+        self._duo_har_dump_path = duo_har_dump_path or os.environ.get('GIMME_AWS_CREDS_DUO_HAR_DUMP_PATH')
+        self._duo_har_entries = []
 
     def do_auth(self):
         """ Follow Duo Universal Prompt flow through to an active Okta user session """
+        try:
+            duo_prompt_url, okta_profile_login = self._initiate_okta_factor_verification()
+            duo_origin, duo_plugin_form_response = self._handle_duo_plugin_form(duo_prompt_url)
 
-        duo_prompt_url, okta_profile_login = self._initiate_okta_factor_verification()
-        duo_origin, duo_plugin_form_response = self._handle_duo_plugin_form(duo_prompt_url)
+            tx_context = self._build_transaction_context(duo_origin, duo_plugin_form_response)
 
-        tx_context = self._build_transaction_context(duo_origin, duo_plugin_form_response)
+            self.ui.info(f"Duo Universal: Using {self.duo_factor}...")
 
-        self.ui.info(f"Duo Universal: Using {self.duo_factor}...")
+            if tx_context['mode'] == 'legacy_form':
+                duo_factor, duo_sid, duo_txid, duo_xsrf = self._trigger_legacy_duo_factor(duo_origin, duo_plugin_form_response)
+                self._wait_for_duo_universal_transaction(duo_origin, duo_txid, duo_sid)
+                self._complete_oidc_exit(duo_origin, duo_txid, duo_sid, duo_factor, duo_xsrf)
+            else:
+                self._perform_js_bundle_flow(tx_context)
 
-        if tx_context['mode'] == 'legacy_form':
-            duo_factor, duo_sid, duo_txid, duo_xsrf = self._trigger_legacy_duo_factor(duo_origin, duo_plugin_form_response)
-            self._wait_for_duo_universal_transaction(duo_origin, duo_txid, duo_sid)
-            self._complete_oidc_exit(duo_origin, duo_txid, duo_sid, duo_factor, duo_xsrf)
-        else:
-            self._perform_js_bundle_flow(tx_context)
+            # The claims_provider factor immediately yields an active user session, no subsequent request for SID required.
+            if 'sid' not in self.session.cookies:
+                raise Exception('Duo authentication succeeded but Okta session cookie (sid) was not established. This may indicate the authorization URL endpoint is not accessible in your Duo configuration.')
 
-        # The claims_provider factor immediately yields an active user session, no subsequent request for SID required.
-        if 'sid' not in self.session.cookies:
-            raise Exception('Duo authentication succeeded but Okta session cookie (sid) was not established. This may indicate the authorization URL endpoint is not accessible in your Duo configuration.')
-
-        return {
-            'apiResponse': {
-                'status': 'SUCCESS',
-                'userSession': {
-                    "username": okta_profile_login,
-                    "session": self.session.cookies['sid'],
-                    "device_token": self.session.cookies.get('DT', '')
+            return {
+                'apiResponse': {
+                    'status': 'SUCCESS',
+                    'userSession': {
+                        "username": okta_profile_login,
+                        "session": self.session.cookies['sid'],
+                        "device_token": self.session.cookies.get('DT', '')
+                    },
+                    'sessionToken': self.session.cookies['sid']
                 },
-                'sessionToken': self.session.cookies['sid']
-            },
-        }
+            }
+        finally:
+            self._write_duo_har_dump()
 
     def _trigger_legacy_duo_factor(self, duo_origin, duo_plugin_form_response):
         # Submit second Duo form (login-form), which triggers a Duo Push, phone call, or accepts the Passcode.
@@ -72,7 +79,7 @@ class OktaDuoUniversal:
         # Once Duo has been approved, load the OIDC exit URL to be redirected to Okta and gain a user session.
         oidc_exit_url = furl(duo_origin) / 'frame/v4/oidc/exit'
         exit_headers = self._get_form_headers()
-        exit_response = self.session.post(
+        exit_response = self._post(
             oidc_exit_url.url,
             data={
                 'txid': duo_txid,
@@ -126,15 +133,7 @@ class OktaDuoUniversal:
                 f'{duo_origin}{path_prefix}/auth/factors/phone_call/poll',
             ],
             'passcode_trigger_urls': [
-                f'{duo_origin}{path_prefix}/auth/factors/bypass_code',
-                f'{duo_origin}{path_prefix}/auth/factors/bypass_code/auth',
-                f'{duo_origin}{path_prefix}/auth/factors/passcode',
-                f'{duo_origin}{path_prefix}/auth/factors/passcode/auth',
-            ],
-            'passcode_status_urls': [
-                f'{duo_origin}{path_prefix}/auth/factors/bypass_code/status',
-                f'{duo_origin}{path_prefix}/auth/factors/passcode/status',
-                f'{duo_origin}{path_prefix}/auth/factors/push/status',
+                f'{duo_origin}{path_prefix}/auth/factors/mobile_otp',
             ],
             'auth_payload_url': f'{duo_origin}{path_prefix}/auth/payload',
             'authz_url': f'{duo_origin}{path_prefix}/auth/authorization_url',
@@ -142,12 +141,13 @@ class OktaDuoUniversal:
         }
 
     def _perform_js_bundle_flow(self, tx_context):
-        headers = self._get_prompt_api_headers(tx_context['req_trace_group'])
+        headers = self._get_prompt_api_headers(tx_context)
+        post_headers = self._get_prompt_api_headers(tx_context, include_origin=True)
         if self.duo_factor == 'Duo Push':
             pkey = self._discover_authenticator_key(tx_context, headers, 'push')
             txid, immediate_result = self._initiate_js_bundle_factor(
                 tx_context,
-                headers,
+                post_headers,
                 tx_context['push_trigger_urls'],
                 {'authkey': tx_context['authkey'], 'pkey': pkey, 'otp_code': self.duo_passcode or ''},
             )
@@ -162,7 +162,7 @@ class OktaDuoUniversal:
             pkey = self._discover_authenticator_key(tx_context, headers, 'phone_call')
             txid, immediate_result = self._initiate_js_bundle_factor(
                 tx_context,
-                headers,
+                post_headers,
                 tx_context['phone_call_trigger_urls'],
                 {'authkey': tx_context['authkey'], 'pkey': pkey},
             )
@@ -176,35 +176,212 @@ class OktaDuoUniversal:
         elif self.duo_factor == 'Passcode':
             if not self.duo_passcode:
                 raise Exception('Duo passcode is required when using Passcode with the Duo JS-bundle flow')
+            self._load_auth_payload(tx_context, headers)
+            self._preauth_initialize(tx_context, headers)
+            self._preauth_evaluate(tx_context, headers)
             txid, immediate_result = self._initiate_js_bundle_factor(
                 tx_context,
-                headers,
+                post_headers,
                 tx_context['passcode_trigger_urls'],
-                {'authkey': tx_context['authkey'], 'passcode': self.duo_passcode},
+                {'authkey': tx_context['authkey'], 'mobile_otp': self.duo_passcode},
             )
             result = immediate_result
             if not result:
-                result = self._wait_for_js_bundle_factor(
-                    tx_context,
-                    headers,
-                    txid,
-                    tx_context['passcode_status_urls'],
-                    ['txid', 'push_txid'],
-                )
+                raise Exception(f'Did not receive result from pass code submission')
         else:
             raise Exception(f'Factor "{self.duo_factor}" is not supported in Duo JS-bundle fallback')
 
         self._complete_js_bundle_auth(tx_context, headers, result)
 
-    def _get_prompt_api_headers(self, req_trace_group):
+    @staticmethod
+    def _get_prompt_referer(tx_context):
+        referer_url = f"{tx_context['duo_origin']}/prompt/{tx_context['akey']}?authkey={tx_context['authkey']}"
+        if tx_context['req_trace_group']:
+            referer_url += f"&req_trace_group={tx_context['req_trace_group']}"
+        return referer_url
+
+    def _get_prompt_api_headers(self, tx_context, include_origin=False):
+        if not isinstance(tx_context, dict):
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0',
+                'Accept': '*/*',
+                'Content-Type': 'application/json',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+            }
+            if tx_context:
+                headers['X-Duo-Req-Trace-Group'] = tx_context
+            return headers
+
         headers = {
-            'User-Agent': "gimme-aws-creds {}".format(version),
-            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0',
+            'Accept': '*/*',
             'Content-Type': 'application/json',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Referer': self._get_prompt_referer(tx_context),
         }
-        if req_trace_group:
-            headers['x-duo-request-id'] = req_trace_group
+        if tx_context['req_trace_group']:
+            headers['X-Duo-Req-Trace-Group'] = tx_context['req_trace_group']
+        if include_origin:
+            headers['Origin'] = tx_context['duo_origin']
         return headers
+
+    @staticmethod
+    def _parse_cookie_header(cookie_header):
+        if not cookie_header:
+            return []
+        simple_cookie = SimpleCookie()
+        simple_cookie.load(cookie_header)
+        return [{'name': name, 'value': morsel.value} for name, morsel in simple_cookie.items()]
+
+    @staticmethod
+    def _headers_to_har_list(headers):
+        if not headers:
+            return []
+        if hasattr(headers, 'items'):
+            return [{'name': str(key), 'value': str(value)} for key, value in headers.items()]
+        return [{'name': str(key), 'value': str(value)} for key, value in headers]
+
+    @staticmethod
+    def _sanitize_body_text(content_type, body_text):
+        if not body_text:
+            return body_text
+        if 'application/json' not in str(content_type).lower():
+            return body_text
+        try:
+            payload = json.loads(body_text)
+        except Exception:
+            return body_text
+
+        if isinstance(payload, dict):
+            # OTP/passcode values are included in HAR for debugging purposes
+            # for secret_key in ['mobile_otp', 'passcode', 'otp_code']:
+            #     if secret_key in payload and payload[secret_key]:
+            #         payload[secret_key] = '******'
+            return json.dumps(payload, separators=(',', ':'))
+        return body_text
+
+    def _append_har_entry(self, started_at, elapsed_seconds, response):
+        if not self._duo_har_dump_path or response is None or not hasattr(response, 'request'):
+            return
+
+        request = response.request
+        request_headers = self._headers_to_har_list(request.headers)
+        request_cookie_header = request.headers.get('Cookie') if request.headers else None
+        request_cookies = self._parse_cookie_header(request_cookie_header)
+        request_body_text = ''
+        if request.body is not None:
+            if isinstance(request.body, bytes):
+                request_body_text = request.body.decode('utf-8', errors='replace')
+            else:
+                request_body_text = str(request.body)
+        request_content_type = request.headers.get('Content-Type', '') if request.headers else ''
+        request_body_text = self._sanitize_body_text(request_content_type, request_body_text)
+
+        response_headers = self._headers_to_har_list(response.headers)
+        response_cookie_headers = []
+        if response.headers:
+            if hasattr(response.headers, 'getlist'):
+                response_cookie_headers = response.headers.getlist('Set-Cookie')
+            elif hasattr(response.headers, 'get_all'):
+                response_cookie_headers = response.headers.get_all('Set-Cookie')
+            elif response.headers.get('Set-Cookie'):
+                response_cookie_headers = [response.headers.get('Set-Cookie')]
+        response_cookies = []
+        for cookie_header in response_cookie_headers:
+            response_cookies.extend(self._parse_cookie_header(cookie_header))
+
+        response_content_type = response.headers.get('Content-Type', '') if response.headers else ''
+        response_body_text = response.text if response.text is not None else ''
+
+        parsed_url = urlparse(request.url)
+        query_items = [{'name': key, 'value': value} for key, value in parse_qsl(parsed_url.query, keep_blank_values=True)]
+        time_ms = int(elapsed_seconds * 1000)
+        entry = {
+            'startedDateTime': datetime.fromtimestamp(started_at, timezone.utc).isoformat(),
+            'time': time_ms,
+            'request': {
+                'method': request.method,
+                'url': request.url,
+                'httpVersion': 'HTTP/1.1',
+                'headers': request_headers,
+                'cookies': request_cookies,
+                'queryString': query_items,
+                'headersSize': -1,
+                'bodySize': len(request_body_text),
+                'postData': {
+                    'mimeType': request_content_type,
+                    'text': request_body_text,
+                } if request_body_text else {'mimeType': request_content_type, 'text': ''},
+            },
+            'response': {
+                'status': response.status_code,
+                'statusText': response.reason,
+                'httpVersion': 'HTTP/1.1',
+                'headers': response_headers,
+                'cookies': response_cookies,
+                'content': {
+                    'size': len(response.content or b''),
+                    'mimeType': response_content_type,
+                    'text': response_body_text,
+                },
+                'redirectURL': response.headers.get('Location', '') if response.headers else '',
+                'headersSize': -1,
+                'bodySize': len(response.content or b''),
+            },
+            'cache': {},
+            'timings': {
+                'blocked': 0,
+                'dns': -1,
+                'connect': -1,
+                'ssl': -1,
+                'send': 0,
+                'wait': time_ms,
+                'receive': 0,
+            },
+        }
+        self._duo_har_entries.append(entry)
+
+    def _request(self, method, url, **kwargs):
+        started_at = time.time()
+        response = None
+        try:
+            response = self.session.request(method, url, **kwargs)
+            return response
+        finally:
+            self._append_har_entry(started_at, time.time() - started_at, response)
+
+    def _get(self, url, **kwargs):
+        return self._request('GET', url, **kwargs)
+
+    def _post(self, url, **kwargs):
+        return self._request('POST', url, **kwargs)
+
+    def _write_duo_har_dump(self):
+        if not self._duo_har_dump_path:
+            return
+        try:
+            dump_dir = os.path.dirname(self._duo_har_dump_path)
+            if dump_dir:
+                os.makedirs(dump_dir, exist_ok=True)
+            har_document = {
+                'log': {
+                    'version': '1.2',
+                    'creator': {
+                        'name': 'gimme-aws-creds',
+                        'version': str(version),
+                    },
+                    'entries': self._duo_har_entries,
+                }
+            }
+            with open(self._duo_har_dump_path, 'w', encoding='utf-8') as handle:
+                json.dump(har_document, handle, indent=2)
+            self.ui.info(f'Duo Universal HAR dump saved to {self._duo_har_dump_path}')
+        except Exception as error:
+            self.ui.warning(f'Unable to write Duo Universal HAR dump to {self._duo_har_dump_path}: {error}')
 
     @staticmethod
     def _flatten_values(value):
@@ -217,9 +394,24 @@ class OktaDuoUniversal:
         else:
             yield value
 
-    def _discover_authenticator_key(self, tx_context, headers, factor_type):
+    def _load_auth_payload(self, tx_context, headers):
         browser_features = self._get_browser_features()
-        init_response = self.session.get(
+        payload_response = self._get(
+            tx_context['auth_payload_url'],
+            params={
+                'authkey': tx_context['authkey'],
+                'browser_features': json.dumps(browser_features, separators=(',', ':')),
+            },
+            headers=headers,
+        )
+        payload_response.raise_for_status()
+        payload_data = payload_response.json()
+        if payload_data.get('stat') != 'OK':
+            raise Exception(f"Duo auth payload load failed: {payload_response.text}")
+        return payload_data.get('response', {})
+
+    def _preauth_initialize(self, tx_context, headers):
+        init_response = self._get(
             tx_context['preauth_init_url'],
             params={
                 'authkey': tx_context['authkey'],
@@ -228,8 +420,14 @@ class OktaDuoUniversal:
             headers=headers,
         )
         init_response.raise_for_status()
+        init_data = init_response.json()
+        if init_data.get('stat') != 'OK':
+            raise Exception(f"Duo pre-auth initialization failed: {init_response.text}")
+        return init_data.get('response', {})
 
-        eval_response = self.session.get(
+    def _preauth_evaluate(self, tx_context, headers):
+        browser_features = self._get_browser_features()
+        eval_response = self._get(
             tx_context['preauth_eval_url'],
             params={
                 'authkey': tx_context['authkey'],
@@ -243,7 +441,13 @@ class OktaDuoUniversal:
         if data.get('stat') != 'OK':
             raise Exception(f"Duo pre-auth evaluation failed: {eval_response.text}")
 
-        response_data = data.get('response', {})
+        return data.get('response', {})
+
+    def _discover_authenticator_key(self, tx_context, headers, factor_type):
+        self._load_auth_payload(tx_context, headers)
+        self._preauth_initialize(tx_context, headers)
+        response_data = self._preauth_evaluate(tx_context, headers)
+
         pkey = self._find_first_factor_pkey(response_data, factor_type)
         if not pkey:
             raise Exception(f'Unable to find a Duo authenticator key for factor type "{factor_type}" in pre-auth response')
@@ -298,7 +502,7 @@ class OktaDuoUniversal:
         factor_response = None
 
         for trigger_url in trigger_urls:
-            factor_response = self.session.post(
+            factor_response = self._post(
                 trigger_url,
                 json=payload,
                 headers=headers,
@@ -340,6 +544,13 @@ class OktaDuoUniversal:
             if result == 'FAILURE' or status_code == 'deny':
                 raise DuoMfaDenied(factor_data)
 
+        authn_eval = response_data.get('authn_evaluation', {})
+        authz_eval = response_data.get('authz_evaluation', {})
+        if authn_eval or authz_eval:
+            if authn_eval.get('is_allowed') and authz_eval.get('is_allowed', True):
+                return txid, factor_data
+            raise DuoMfaDenied(factor_data)
+
         if not txid:
             raise Exception('Duo factor trigger response did not contain a transaction id')
         return txid, None
@@ -364,7 +575,7 @@ class OktaDuoUniversal:
                     if not status_url.endswith('/poll'):
                         params['saw_good_news'] = 'false'
 
-                    status_response = self.session.get(
+                    status_response = self._get(
                         status_url,
                         params=params,
                         headers=headers,
@@ -412,18 +623,19 @@ class OktaDuoUniversal:
         # After push approval, use the OIDC external exit endpoint to complete auth
         response_data = push_result.get('response', {})
         result_data = response_data.get('result', {})
-        if isinstance(result_data, dict):
+        if isinstance(result_data, dict) and result_data:
             auth_result = result_data.get('auth_result', {})
         else:
-            auth_result = response_data.get('auth_result', {})
+            auth_result = response_data.get('auth_result', {}) or response_data
         authn_eval = auth_result.get('authn_evaluation', {})
 
         if not authn_eval.get('is_allowed'):
             raise Exception('Duo authentication evaluation failed: is_allowed=false')
 
-        finalize_response = self.session.get(
+        finalize_response = self._get(
             tx_context['finalize_auth_url'],
             allow_redirects=True,
+            headers=headers,
             params={
                 'authkey': tx_context['authkey'],
             }
@@ -431,9 +643,10 @@ class OktaDuoUniversal:
         finalize_response.raise_for_status()
         finalize_json = finalize_response.json()
         if finalize_json.get('stat') == 'OK':
-            exit_response = self.session.get(
+            exit_response = self._get(
                 finalize_json['response']['url'],
                 allow_redirects=True,
+                headers={'User-Agent': headers['User-Agent'], 'Referer': headers['Referer'], 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},
             )
             exit_response.raise_for_status()
 
@@ -454,7 +667,7 @@ class OktaDuoUniversal:
 
     def _submit_duo_login_form(self, duo_login_form_data, login_form_action_url):
         # Submit Duo's form id=login-form, which triggers a Duo Push, phone call, or accepts a Passcode.
-        duo_login_form_response = self.session.post(
+        duo_login_form_response = self._post(
             login_form_action_url.url,
             data=duo_login_form_data,
             headers=self._get_form_headers(),
@@ -471,7 +684,7 @@ class OktaDuoUniversal:
 
     def _handle_duo_plugin_form(self, duo_prompt_url):
         # Request Duo prompt
-        verify_get_response = self.session.get(
+        verify_get_response = self._get(
             duo_prompt_url,
         )
         verify_get_response.raise_for_status()
@@ -485,7 +698,7 @@ class OktaDuoUniversal:
 
         # Submit first Duo form (plugin_form)
         form_data = self._get_duo_universal_plugin_form_data(verify_get_response)
-        duo_plugin_form_response = self.session.post(
+        duo_plugin_form_response = self._post(
             verify_get_response.url,
             data=form_data,
             headers=self._get_form_headers(),
@@ -495,7 +708,7 @@ class OktaDuoUniversal:
 
     def _initiate_okta_factor_verification(self):
         # POST to the Okta factor verify URL gives us the URL to request to load Duo
-        verify_post_response = self.session.post(
+        verify_post_response = self._post(
             self.okta_factor['_links']['verify']['href'],
             params={'rememberDevice': self.remember_device},
             json={'stateToken': self.state_token},
@@ -519,7 +732,7 @@ class OktaDuoUniversal:
             tries += 1
             time.sleep(0.5)
 
-            status_response = self.session.post(
+            status_response = self._post(
                 status_url.url,
                 data=status_data,
                 headers=headers,

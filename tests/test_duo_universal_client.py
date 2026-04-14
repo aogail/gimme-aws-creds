@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock
 
@@ -298,8 +300,8 @@ class TestDuoUniversalClient(unittest.TestCase):
         assert result['apiResponse']['userSession']['session'] == self.OKTA_SID_VALUE
 
     @responses.activate
-    def test_universal_passcode_js_bundle_passcode_alias_endpoint(self):
-        self.configure_duo_js_bundle_responses(duo_factor='Passcode', passcode='123456', passcode_endpoint='passcode')
+    def test_universal_passcode_js_bundle_matches_browser_sequence(self):
+        self.configure_duo_js_bundle_responses(duo_factor='Passcode', passcode='123456')
         session = requests.Session()
         duo = OktaDuoUniversal(ui=MockUserInterface(),
                                session=session,
@@ -311,6 +313,18 @@ class TestDuoUniversalClient(unittest.TestCase):
         result = duo.do_auth()
         assert result['apiResponse']['status'] == 'SUCCESS'
         assert result['apiResponse']['userSession']['session'] == self.OKTA_SID_VALUE
+
+        called_urls = [call.request.url for call in responses.calls]
+        payload_index = next(i for i, url in enumerate(called_urls) if '/auth/payload?' in url)
+        passcode_index = next(i for i, url in enumerate(called_urls) if '/auth/factors/mobile_otp' in url)
+        finalize_index = next(i for i, url in enumerate(called_urls) if '/auth/finalize_auth?' in url)
+        assert payload_index < passcode_index < finalize_index
+
+        passcode_request = responses.calls[passcode_index].request
+        passcode_body = passcode_request.body.decode('utf-8') if isinstance(passcode_request.body, bytes) else passcode_request.body
+        assert json.loads(passcode_body) == {'authkey': self.DUO_JS_AUTHKEY, 'mobile_otp': '123456'}
+        assert passcode_request.headers['Origin'] == self.DUO_ORIGIN
+        assert passcode_request.headers['Referer'].startswith(f'{self.DUO_ORIGIN}/prompt/{self.DUO_JS_AKEY}?authkey={self.DUO_JS_AUTHKEY}')
 
     def test_no_preferred_device(self):
         session = requests.Session()
@@ -325,6 +339,49 @@ class TestDuoUniversalClient(unittest.TestCase):
                                duo_passcode='12345')
         form_action, form_data = duo._get_duo_universal_login_form_data(login_form_response)
         assert form_data['device'] == 'phone1'
+
+    @responses.activate
+    def test_duo_har_dump_captures_500_response(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            har_path = os.path.join(tmpdir, 'duo-debug.har')
+            session = requests.Session()
+            duo = OktaDuoUniversal(
+                ui=MockUserInterface(),
+                session=session,
+                state_token=self.OKTA_STATE_TOKEN,
+                okta_factor=self.OKTA_FACTOR,
+                remember_device=True,
+                duo_har_dump_path=har_path,
+            )
+
+            endpoint = 'https://duo-tenant.duosecurity.com/prompt/debug/auth/factors/mobile_otp'
+            responses.add(
+                method=responses.POST,
+                url=endpoint,
+                status=500,
+                body='{"stat":"FAIL"}',
+                content_type='application/json',
+            )
+
+            response = duo._post(
+                endpoint,
+                json={'authkey': 'AXBBTO9FWHV3P8LOX6D2', 'mobile_otp': '946676'},
+                headers=duo._get_prompt_api_headers('trace-group-123'),
+            )
+            with self.assertRaises(requests.HTTPError):
+                response.raise_for_status()
+
+            duo._write_duo_har_dump()
+            with open(har_path, 'r', encoding='utf-8') as handle:
+                har_data = json.load(handle)
+
+            assert 'log' in har_data
+            assert har_data['log']['version'] == '1.2'
+            assert len(har_data['log']['entries']) == 1
+            entry = har_data['log']['entries'][0]
+            assert entry['request']['url'] == endpoint
+            assert entry['response']['status'] == 500
+            assert entry['request']['postData']['text'] == '{"authkey":"AXBBTO9FWHV3P8LOX6D2","mobile_otp":"946676"}'
 
     def configure_duo_responses(self, duo_factor, passcode=None):
         # Initial request to Okta to verify IDP factor
@@ -508,6 +565,10 @@ class TestDuoUniversalClient(unittest.TestCase):
     def _configure_duo_js_bundle_api(self, duo_factor, passcode=None, passcode_endpoint='bypass_code', phone_call_result_shape='nested_result'):
         base = f'{self.DUO_ORIGIN}/prompt/{self.DUO_JS_AKEY}'
         responses.add(method=responses.GET,
+                      url=f'{base}/auth/payload',
+                      match=[responses.matchers.query_param_matcher({'authkey': self.DUO_JS_AUTHKEY, 'browser_features': self.DUO_BROWSER_FEATURES})],
+                      body=json.dumps({'stat': 'OK', 'response': {'next_action': 'load_prompt'}}))
+        responses.add(method=responses.GET,
                       url=f'{base}/pre_authn/initialization',
                       match=[responses.matchers.query_param_matcher({'authkey': self.DUO_JS_AUTHKEY, 'is_ipad': 'false'})],
                       body='{"stat":"OK","response":{}}')
@@ -590,19 +651,10 @@ class TestDuoUniversalClient(unittest.TestCase):
                           match=[responses.matchers.query_param_matcher({'authkey': self.DUO_JS_AUTHKEY, 'txid': self.DUO_JS_PHONE_CALL_TXID})],
                           body=json.dumps(final_phone_call_payload))
         else:
-            if passcode_endpoint == 'passcode':
-                responses.add(method=responses.POST,
-                              url=f'{base}/auth/factors/bypass_code',
-                              status=404,
-                              body='{"stat":"FAIL"}')
-                responses.add(method=responses.POST,
-                              url=f'{base}/auth/factors/bypass_code/auth',
-                              status=404,
-                              body='{"stat":"FAIL"}')
             responses.add(method=responses.POST,
-                          url=f'{base}/auth/factors/{passcode_endpoint}',
-                          match=[responses.matchers.json_params_matcher({'authkey': self.DUO_JS_AUTHKEY, 'passcode': passcode})],
-                          body=json.dumps({'stat': 'OK', 'response': {'result': {'result': 'SUCCESS', 'status_code': 'allow', 'auth_result': {'authn_evaluation': {'is_allowed': True}}}}}))
+                          url=f'{base}/auth/factors/mobile_otp',
+                          match=[responses.matchers.json_params_matcher({'authkey': self.DUO_JS_AUTHKEY, 'mobile_otp': passcode})],
+                          body=json.dumps({'stat': 'OK', 'response': {'authn_evaluation': {'is_allowed': True, 'auth_method_type': 'mobile_otp', 'authenticator_key': self.DUO_JS_PKEY, 'status_enum': 5, 'request_browser_trust': False}, 'authz_evaluation': {'is_allowed': True, 'blocks': [], 'warns': [], 'device': {'os': 13}}}}))
 
         okta_oidc_callback = 'https://oktatenant.oktapreview.com/oauth2/v1/authorize/callback?state=oidcexitstate&code=oidccode'
         responses.add(method=responses.GET,
